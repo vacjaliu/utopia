@@ -13,6 +13,8 @@ mod jobs_routes;
 mod kbs;
 mod mapping_routes;
 mod mcp;
+mod mcp_actions;
+mod mcp_ontology;
 mod members_routes;
 mod oidc_routes;
 pub(crate) mod ontology_routes;

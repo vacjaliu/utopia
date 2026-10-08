@@ -1,6 +1,6 @@
 # Agents over MCP
 
-Utopia serves every knowledge base as a **Model Context Protocol** server. Any MCP client — Claude Desktop, Cursor, an agent framework, a script — can search a base, read a document, look up an entity and ask what changed, with the same permissions as the person whose token it carries. Reading needs nothing but a token. One tool records: `remember` asks a `write` token held by an editor, and what it records **waits for a person's nod** before it reaches the graph.
+Utopia serves every knowledge base as a **Model Context Protocol** server. Any MCP client — Claude Desktop, Cursor, an agent framework, a script — can search a base, read a document, look up an entity and ask what changed, with the same permissions as the person whose token it carries. Reading needs nothing but a token. Editors can also manage ontology definitions and executable business rules with a `write` token. `remember` records a sentence whose extracted facts **wait for a person's nod** before they reach the graph.
 
 ## Get a token
 
@@ -9,7 +9,7 @@ Tokens belong to people, not to bases: **Account → Agents & tokens → Persona
 | Field | Meaning |
 |---|---|
 | Name | For your own bookkeeping; shows in the token list and in the audit log |
-| Scope | `read` (default) or `write`. Scope is a **ceiling**, not a grant: a token can never do more than its owner can. `remember` needs both — the `write` scope, and editor rights in that base. A viewer's `write` token still cannot record |
+| Scope | `read` (default) or `write`. Scope is a **ceiling**, not a grant: a token can never do more than its owner can. Ontology edits and `remember` need both — the `write` scope, and editor rights in that base. A viewer's `write` token still cannot edit |
 | Knowledge bases | Optional. Leave empty and the token reaches every base its owner can open; pick some to narrow it |
 | Expires in | 90 days by default |
 
@@ -47,6 +47,62 @@ Three methods are served:
 | `changes` | What the graph learned or revised in a window of **record** time: asserted, corrected, rejected, merged. Needs no entity; use it when the question names a period, not a subject |
 | `search_docs` | Utopia's own manual, for questions about how the platform works. Never the user's documents |
 | `remember` | Record one sentence into the base's memory. **Needs a `write` token held by an editor**; a token without it does not see this tool in `tools/list`, and calling it anyway says why |
+| `list_ontology` | List class, relation and attribute **definitions**, with IDs and usage counts |
+| `list_rule_definitions` | List executable business rule definitions as structured data, including IDs and enabled state |
+| `rule_versions` | Read one executable business rule's definition history |
+| `list_statement_sources` | Find an existing `statements` source ID in this base without exposing its ingest key |
+| `statement_status` | Read one submitted observation's document and graph processing state, plus observed open and typed fact counts |
+| `create_entity_type`, `update_entity_type` | Create or replace a class definition. These do not create an entity instance |
+| `create_relation_type`, `update_relation_type` | Create or replace a relation or attribute definition. These do not assert a relationship |
+| `create_rule`, `update_rule` | Create or update a business rule using the existing validated rule engine. A definition does not execute when saved |
+| `run_rules` | Run the existing materialization engine now and return its actual rule and insertion counts |
+| `submit_statements` | Submit entity and relationship statements to an existing `statements` source using the open extraction contract. Requires an editor's `write` token; ingestion is not a typed assertion |
+| `list_actions`, `action_status` | List KB-local action definitions and inspect one durable execution attempt, including its outcome or unresolved `running` state |
+| `create_action`, `update_action` | Define or edit a KB-local action with one registered handler: `run_rules` or `submit_statements` |
+| `execute_action` | Run a defined action once for a caller-generated UUID `request_id`; a replay reads the same attempt |
+
+Editing and execution tools require a `write` token held by an editor. They call the existing ontology, rule and statement handlers and use their validation and audit trail. `tools/list` hides them from read-only callers. Tool results include `structuredContent`: successful writes contain an operation and a result with an ID or counts; failures set `isError: true` and include `error.code` and `error.message`. A duplicate definition key returns `conflict`; a duplicate rule name returns `duplicate_rule`; a duplicate action key returns `action_key_exists`. After an uncertain network outcome, list definitions by key/name before retrying. Updates retain omitted definition fields.
+
+**Example: create a class, then a declared relation.** Replace the IDs, URL and token with your own. These commands change definitions in that base; they use synthetic names here. IDs in `domains` and `ranges` must name classes in the same base. To create a rule, call `create_rule` with `subject_type_id`, a `conclusion` (`typing`, `attribute`, `computed` or `relation`), its matching conclusion fields and nonempty `conditions`; `tools/list` gives the current schema. `run_rules` is the separate execution step.
+
+```bash
+curl -sS -X POST "https://your-utopia/api/v1/kbs/$KB/mcp" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_entity_type","arguments":{"key":"performance_cycle","label":"Performance Cycle"}}}'
+
+curl -sS -X POST "https://your-utopia/api/v1/kbs/$KB/mcp" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_relation_type","arguments":{"key":"belongs_to_cycle","label":"belongs to cycle","kind":"relation","domains":["<existing-subject-class-uuid>"],"ranges":["<created-class-uuid>"]}}}'
+```
+
+Entity **instances** and relationship **assertions** are separate from these definitions. First create a **Statements** source in the Library using the [ingest guide](ingest.md#statements-source--the-structured-push-interface), then call `list_statement_sources` to find its ID. This setup is necessary; the MCP tools do not create a source or issue a source key. `submit_statements` accepts that source ID and a `payload` with `external_id`, `e`, `s`, and `n` in the [statements contract](../../docs/decisions/0054-a-source-may-push-statements-in-the-open-contract.md). The personal token supplies the editor's authorization; the source ingest key is not sent to MCP. The existing source pipeline stores the payload as its own evidence, creates open entity and statement records, and lets typed alignment and review govern what enters the typed graph. Reuse an `external_id` to submit a revised observation; an unchanged retry returns `unchanged`. `submit_statements` does not accept `deleted: true`.
+
+The response distinguishes `action` (`created`, `updated`, or `unchanged`) from the observation's stable `document_id`, `version`, `document_status`, `graph_status`, and open/typed fact counts linked to its current chunk. After a submit, poll `statement_status` by `source_id` and `external_id`, then use `find_entities` and `entity_facts` to verify the actual graph IDs and facts. A zero typed fact count is not a success signal for typed alignment; these counts do not claim a review decision. Bad payloads and a source from another base fail with `isError: true` and a structured error. No direct typed fact write is introduced.
+
+### Declared local actions
+
+An action definition is separate from a business rule and from each action run. `create_action` requires a unique `key`, `label` and one known `kind`:
+
+- `run_rules`: no `config`, no execution arguments; invokes the same materialization as the direct `run_rules` tool.
+- `submit_statements`: `config` must contain exactly `source_id` for an existing extraction-enabled statements source in this base. Execution `args` are the source's open-contract `{external_id,e,s,n}` payload. It ingests an observation, not a typed assertion.
+
+`update_action` accepts `id`, the observed `expected_revision`, and any of `label`, `description`, `config`, `enabled`; key and kind stay fixed. Each edit increments `revision`. A stale edit returns `action_revision_conflict`. `list_actions` returns the definitions. The action is only a declaration until `execute_action` runs it. No rule fires an action automatically in this version.
+
+For each execution, pass the `expected_revision` returned by `create_action` or `list_actions`, generate a fresh UUID `request_id`, and reuse both if the response is lost. A new request with a stale revision returns `action_revision_conflict`. The return includes a durable `run` with `id`, `status` (`running`, `succeeded` or `failed`), result or structured error, and a `replayed` flag. The same actor, action, request ID, revision and arguments returns the prior run without calling the handler again, even if the definition was later changed. Reusing an ID with different arguments or revision gives `request_id_conflict`. Poll `action_status` using the run ID. If a run remains `running` after a server interruption, its effect may be uncertain; inspect source and graph state before deliberately starting a new operation. Action handlers never execute arbitrary code, shell commands or user-supplied URLs. The proposed external HTTP action design and automatic rule-to-action bindings are not implemented.
+
+```bash
+curl -sS -X POST "https://your-utopia/api/v1/kbs/$KB/mcp" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_action","arguments":{"key":"refresh_rules","label":"Refresh rules","kind":"run_rules"}}}'
+
+# Replace ACTION_ID and ACTION_REVISION with the returned result.id and result.revision;
+# generate REQUEST_ID once per intended run.
+curl -sS -X POST "https://your-utopia/api/v1/kbs/$KB/mcp" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"execute_action\",\"arguments\":{\"id\":\"$ACTION_ID\",\"request_id\":\"$REQUEST_ID\",\"expected_revision\":$ACTION_REVISION,\"args\":{}}}}"
+```
+
+For a synthetic class → attribute/relation definition → rule definition → rule execution call sequence, run `bash scripts/examples/mcp_ontology_demo.sh` from the repository root after setting `UTOPIA_MCP_URL` and `UTOPIA_TOKEN`. Set `UTOPIA_STATEMENTS_SOURCE_ID` to an existing statements source ID to also submit two synthetic statements and read their initial processing status. Use a disposable base: the script creates definitions and, with that optional source, submits an observation. Background extraction and alignment may finish later.
 
 The two time axes matter here. `at` reads **world time** (when something was true); `as_of` reads **record time** (what Utopia held at that moment, before it revised it), and `changes` lists what moved on that axis in a window. They are separate parameters on purpose: folded into one they would answer "what happened in March" with "what we learned in March", and both look plausible.
 
@@ -97,10 +153,11 @@ versioned snapshot of the evidence set.
 
 ## Structured results alongside the text
 
-`find_entities`, `search_chunks`, `entity_facts` and `changes` return a JSON object
-in `result.structuredContent`, beside the unchanged human-readable `content`.
-No extra argument or protocol upgrade is needed. Other tools remain text-only.
-Read the JSON field directly; the text is presentation, not a format to parse.
+`find_entities`, `search_chunks`, `entity_facts`, `changes`, and the ontology,
+rule, statement, and action tools listed above return a JSON object in
+`result.structuredContent` beside human-readable `content`. No extra argument
+or protocol upgrade is needed. Read the JSON field directly; the text is
+presentation, not a format to parse.
 
 Every structured result includes `kb_id`. IDs are opaque UUID strings, timestamps
 are RFC3339 with fractional seconds preserved, unknown optional values are `null`,

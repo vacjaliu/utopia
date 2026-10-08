@@ -25,6 +25,7 @@ use utopia_core::models::Role;
 use uuid::Uuid;
 
 use super::tools::{self, ToolCtx, ToolSink};
+use super::{mcp_actions, mcp_ontology};
 use crate::error::ApiResult;
 use crate::state::AppState;
 
@@ -38,8 +39,8 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// 一个被投喂了脏文档的 agent 拿它做什么，都还没答完（0014 的混淆代理那一节）。
 /// 业务规则的两个只读工具也在这里（0021）：判据要看得见——一个 agent 解释
 /// 「凭什么算含气井」时，该读到那条规则和它的阈值，而不是自己猜一个。
-/// **写规则不放**：推理的判据由人写下，而一次工具调用分不出「人口述、agent
-/// 代打」与「模型自己编了一条」
+/// 本体编辑工具的独立清单在 `mcp_ontology`，只对有编辑权限的外部 MCP
+/// 客户端开放；应用内 chat 不获得它们。
 const EXPOSED: [&str; 11] = [
     "search_chunks",
     "get_document",
@@ -65,7 +66,13 @@ const WRITABLE: [&str; 1] = ["remember"];
 /// `can_write` = 令牌 scope 是 write **且** 这个人在这个库里 editor 以上。
 /// 两个条件缺一不可：scope 是上限，角色才是权限（0014）
 fn is_exposed(name: &str, can_write: bool) -> bool {
-    EXPOSED.contains(&name) || (can_write && WRITABLE.contains(&name))
+    EXPOSED.contains(&name)
+        || mcp_ontology::READ.contains(&name)
+        || mcp_actions::READ.contains(&name)
+        || (can_write
+            && (WRITABLE.contains(&name)
+                || mcp_ontology::WRITE.contains(&name)
+                || mcp_actions::WRITE.contains(&name)))
 }
 
 /// 认证 + 授权。**两道，不是一道。**
@@ -144,6 +151,21 @@ fn to_mcp_tools(openai: &Value, can_write: bool) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn available_tools(can_write: bool) -> Vec<Value> {
+    let mut listed = to_mcp_tools(&super::chat::tools_schema(can_write, &[]), can_write);
+    listed.extend(mcp_ontology::definitions().into_iter().filter(|tool| {
+        tool["name"]
+            .as_str()
+            .is_some_and(|name| is_exposed(name, can_write))
+    }));
+    listed.extend(mcp_actions::definitions().into_iter().filter(|tool| {
+        tool["name"]
+            .as_str()
+            .is_some_and(|name| is_exposed(name, can_write))
+    }));
+    listed
+}
+
 fn ok(id: Option<Value>, result: Value) -> Json<Value> {
     Json(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
@@ -198,7 +220,7 @@ pub async fn handle(
             id,
             json!({
                 // 传空的数据源列表：`query_data` 没放出来，那份描述也就不必生成
-                "tools": to_mcp_tools(&super::chat::tools_schema(can_write, &[]), can_write)
+                "tools": available_tools(can_write)
             }),
         ),
         "tools/call" => {
@@ -208,7 +230,10 @@ pub async fn handle(
                 // 三种「不行」要分得开，否则客户端只能反复重试：
                 // 拿不到的工具（query_data）是「这一版没放出来」，写工具是
                 // 「这枚令牌/这个人写不了」——后者人改得了，前者改不了
-                let message = if WRITABLE.contains(&name) {
+                let message = if WRITABLE.contains(&name)
+                    || mcp_ontology::WRITE.contains(&name)
+                    || mcp_actions::WRITE.contains(&name)
+                {
                     format!(
                         "Tool '{name}' needs a token with the write scope, \
                          held by an editor in this base"
@@ -219,30 +244,61 @@ pub async fn handle(
                 return Ok(rpc_err(id, -32601, &message));
             }
             // 与聊天共用参数守卫：缺少 query 不能变成一次成功的空搜索。
-            let result = match super::chat::check_call(
-                &super::chat::tools_schema(can_write, &[]),
-                name,
-                &args.to_string(),
-            ) {
-                Err((text, step)) => tools::ToolResult::new(text, step).error(),
-                Ok(args) => {
-                    // `mounted_sources` 仍旧空着：`query_data` 没放出来，给了也没人用。
-                    // `can_write` 不再写死 false——它现在是令牌与角色一起算出来的
-                    let ctx = ToolCtx {
-                        state: &state,
-                        kb_id,
-                        workspace_id: kb.workspace_id,
-                        mounted_sources: &[],
-                        can_write,
-                        actor: Some(user.id),
-                        // 「谁说的」要答到 agent 这一层：一个人可以同时挂三个客户端
-                        via_token: Some(auth.token_id),
-                        // agent 的意图不在请求里；同名按事实数排
-                        question: None,
-                    };
-                    let mut sink = ToolSink::default();
-                    tools::dispatch(&ctx, &mut sink, name, &args).await
+            let result = if mcp_actions::READ.contains(&name) || mcp_actions::WRITE.contains(&name)
+            {
+                let called = mcp_actions::execute(&state, &user, kb_id, name, &args).await;
+                let run_failed = called.as_ref().is_ok_and(|value| {
+                    name == "execute_action" && value["result"]["run"]["status"] == "failed"
+                });
+                let response = mcp_ontology::response(called);
+                if run_failed {
+                    response.error()
+                } else {
+                    response
                 }
+            } else if mcp_ontology::READ.contains(&name) || mcp_ontology::WRITE.contains(&name) {
+                mcp_ontology::response(
+                    mcp_ontology::execute(state.clone(), user.clone(), kb_id, name, &args).await,
+                )
+            } else {
+                match super::chat::check_call(
+                    &super::chat::tools_schema(can_write, &[]),
+                    name,
+                    &args.to_string(),
+                ) {
+                    Err((text, step)) => tools::ToolResult::new(text, step).error(),
+                    Ok(args) => {
+                        // `mounted_sources` 仍旧空着：`query_data` 没放出来，给了也没人用。
+                        // `can_write` 不再写死 false——它现在是令牌与角色一起算出来的
+                        let ctx = ToolCtx {
+                            state: &state,
+                            kb_id,
+                            workspace_id: kb.workspace_id,
+                            mounted_sources: &[],
+                            can_write,
+                            actor: Some(user.id),
+                            // 「谁说的」要答到 agent 这一层：一个人可以同时挂三个客户端
+                            via_token: Some(auth.token_id),
+                            // agent 的意图不在请求里；同名按事实数排
+                            question: None,
+                        };
+                        let mut sink = ToolSink::default();
+                        tools::dispatch(&ctx, &mut sink, name, &args).await
+                    }
+                }
+            };
+            let audit_detail = if name == "submit_statements" {
+                json!({
+                    "tool": name,
+                    "source_id": args.get("source_id"),
+                    "external_id": args.get("payload").and_then(|p| p.get("external_id")),
+                    "document_id": result.structured_content.as_ref()
+                        .and_then(|content| content.get("result"))
+                        .and_then(|content| content.get("observation"))
+                        .and_then(|observation| observation.get("document_id")),
+                })
+            } else {
+                json!({ "tool": name })
             };
             let _ = utopia_store::audit::record(
                 &state.pool,
@@ -251,7 +307,7 @@ pub async fn handle(
                 "mcp.tool_called",
                 "personal_token",
                 Some(auth.token_id),
-                json!({ "tool": name }),
+                audit_detail,
             )
             .await;
             ok(id, tool_result(result))

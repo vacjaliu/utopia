@@ -581,8 +581,46 @@ pub async fn push_statements(
         return Err(utopia_core::AppError::Unauthorized.into());
     }
 
+    run_statements_push(&state, &source, &bytes).await
+}
+
+/// Personal-token MCP writes use the same validated ingestion and run ledger as
+/// the source-token endpoint. The MCP handler has already enforced write scope
+/// and editor membership; source ownership is checked here before any write.
+pub(crate) async fn submit_statements_via_mcp(
+    state: &AppState,
+    kb_id: Uuid,
+    source_id: Uuid,
+    payload: &serde_json::Value,
+) -> ApiResult<serde_json::Value> {
+    let source = utopia_store::sources::get(&state.pool, source_id).await?;
+    if source.kb_id != kb_id || source.kind != "statements" {
+        return Err(utopia_core::AppError::NotFound.into());
+    }
+    if !source.extracts() {
+        return Err(utopia_core::AppError::invalid(
+            "source_not_extracted",
+            "This statements source is configured not to extract",
+        )
+        .into());
+    }
+    let bytes = serde_json::to_vec(payload).map_err(|err| {
+        utopia_core::AppError::invalid_detail(
+            "invalid_arguments",
+            "Cannot serialize statements payload",
+            err.to_string(),
+        )
+    })?;
+    Ok(run_statements_push(state, &source, &bytes).await?.0)
+}
+
+async fn run_statements_push(
+    state: &AppState,
+    source: &utopia_core::models::Source,
+    bytes: &[u8],
+) -> ApiResult<Json<serde_json::Value>> {
     let run = utopia_store::sources::start_run(&state.pool, source.id).await?;
-    match handle_statements_push(&state, &source, &bytes).await {
+    match handle_statements_push(state, source, bytes).await {
         Ok(action) => {
             let (created, updated) = match action {
                 crate::ingest_sources::IngestAction::Created => (1, 0),
@@ -599,13 +637,18 @@ pub async fn push_statements(
         }
         Err(err) => {
             let msg = err.message().to_string();
+            let failed = matches!(err, PushError::Failed(_));
             utopia_store::sources::finish_run(&state.pool, run, source.id, Some(&msg), 0, 0)
                 .await?;
-            if let PushError::Failed(_) = err {
+            if failed {
                 utopia_store::sources::finish_sync(&state.pool, source.id, Some(&msg), 0).await?;
             }
             state.emit_source(source.kb_id);
-            Err(utopia_core::AppError::Validation(msg).into())
+            if failed {
+                Err(utopia_core::AppError::Other(anyhow::anyhow!(msg)).into())
+            } else {
+                Err(utopia_core::AppError::Validation(msg).into())
+            }
         }
     }
 }

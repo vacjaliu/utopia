@@ -202,6 +202,669 @@ fn uuid(value: &Value) -> Uuid {
     value.as_str().unwrap().parse().unwrap()
 }
 
+#[tokio::test]
+async fn ontology_editor_tools_share_http_validation_and_permissions() -> anyhow::Result<()> {
+    let Some(mut f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let read = f
+        .request(f.kb, "tools/list", json!({}))
+        .await
+        .map_err(|e| e.0)?
+        .0;
+    let names: Vec<&str> = read["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"list_ontology"));
+    assert!(!names.contains(&"create_entity_type"));
+    assert_eq!(f.call("list_ontology", json!({})).await?["isError"], false);
+    let denied = f.request(f.kb, "tools/call", json!({
+        "name":"create_entity_type", "arguments":{"key":"weighted_thing","label":"Weighted Thing"}
+    })).await.map_err(|e| e.0)?.0;
+    assert_eq!(denied["error"]["code"], -32601);
+
+    let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+    sqlx::query("UPDATE kb_members SET role='editor' WHERE kb_id=$1 AND user_id=$2")
+        .bind(f.kb)
+        .bind(auth.user_id)
+        .execute(&f.state.pool)
+        .await?;
+    f.token = utopia_store::tokens::issue(
+        &f.state.pool,
+        auth.user_id,
+        "ontology editor test",
+        "write",
+        Some(&[f.kb]),
+        None,
+    )
+    .await?
+    .1;
+    let write = f
+        .request(f.kb, "tools/list", json!({}))
+        .await
+        .map_err(|e| e.0)?
+        .0;
+    assert!(write["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "create_entity_type"));
+    let typo = f
+        .call(
+            "create_entity_type",
+            json!({
+                "key":"weighted_thing","label":"Weighted Thing","parnets":[]
+            }),
+        )
+        .await?;
+    assert_eq!(typo["isError"], true);
+    assert_eq!(
+        typo["structuredContent"]["error"]["code"],
+        "unknown_argument"
+    );
+    let unknown_parent = f
+        .call(
+            "create_entity_type",
+            json!({
+                "key":"weighted_thing","label":"Weighted Thing","parents":[Uuid::now_v7()]
+            }),
+        )
+        .await?;
+    assert_eq!(
+        unknown_parent["structuredContent"]["error"]["code"],
+        "unknown_class"
+    );
+    let not_created: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM entity_types WHERE kb_id=$1 AND key='weighted_thing'",
+    )
+    .bind(f.kb)
+    .fetch_one(&f.state.pool)
+    .await?;
+    assert_eq!(not_created, 0);
+
+    let class = f
+        .call(
+            "create_entity_type",
+            json!({
+                "key":"weighted_thing","label":"Weighted Thing"
+            }),
+        )
+        .await?;
+    assert_eq!(class["isError"], false, "{class}");
+    let class_id = uuid(&class["structuredContent"]["result"]["id"]);
+    let duplicate = f
+        .call(
+            "create_entity_type",
+            json!({
+                "key":"weighted_thing","label":"Weighted Thing"
+            }),
+        )
+        .await?;
+    assert_eq!(duplicate["isError"], true);
+    assert_eq!(duplicate["structuredContent"]["error"]["code"], "conflict");
+    let ontology = f.call("list_ontology", json!({})).await?;
+    assert!(ontology["structuredContent"]["result"]["entity_types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|ty| ty["id"] == class_id.to_string()));
+    let updated = f
+        .call(
+            "update_entity_type",
+            json!({
+                "id":class_id,"label":"Weighted Item"
+            }),
+        )
+        .await?;
+    assert_eq!(updated["isError"], false, "{updated}");
+
+    let subject_type: Uuid =
+        sqlx::query_scalar("SELECT id FROM entity_types WHERE kb_id=$1 AND key='thing'")
+            .bind(f.kb)
+            .fetch_one(&f.state.pool)
+            .await?;
+    let weight: Uuid =
+        sqlx::query_scalar("SELECT id FROM relation_types WHERE kb_id=$1 AND key='weight'")
+            .bind(f.kb)
+            .fetch_one(&f.state.pool)
+            .await?;
+    let relation = f
+        .call(
+            "create_relation_type",
+            json!({
+                "key":"evaluates","label":"evaluates","kind":"relation",
+                "domains":[subject_type],"ranges":[class_id]
+            }),
+        )
+        .await?;
+    assert_eq!(relation["isError"], false, "{relation}");
+    let relation_id = uuid(&relation["structuredContent"]["result"]["id"]);
+    let relation_update = f
+        .call(
+            "update_relation_type",
+            json!({
+                "id":relation_id,"label":"assesses","temporal":"event"
+            }),
+        )
+        .await?;
+    assert_eq!(relation_update["isError"], false, "{relation_update}");
+    let after = f.call("list_ontology", json!({})).await?;
+    let relation_view = after["structuredContent"]["result"]["relation_types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == relation_id.to_string())
+        .unwrap();
+    assert_eq!(relation_view["domains"], json!([subject_type]));
+    assert_eq!(relation_view["ranges"], json!([class_id]));
+    assert_eq!(relation_view["temporal"], "event");
+
+    let rule = f
+        .call(
+            "create_rule",
+            json!({
+                "name":"Weighted things", "subject_type_id":subject_type,
+                "conclusion":"typing", "conclude_type_id":class_id,
+                "conditions":[{"predicate_id":weight,"op":"present"}]
+            }),
+        )
+        .await?;
+    assert_eq!(rule["isError"], false, "{rule}");
+    let rule_id = uuid(&rule["structuredContent"]["result"]["id"]);
+    let definitions = f.call("list_rule_definitions", json!({})).await?;
+    assert!(definitions["structuredContent"]["result"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["id"] == rule_id.to_string()));
+    let versions = f.call("rule_versions", json!({"id":rule_id})).await?;
+    assert_eq!(versions["isError"], false, "{versions}");
+    let run = f.call("run_rules", json!({})).await?;
+    assert_eq!(run["isError"], false, "{run}");
+    assert!(run["structuredContent"]["result"]["inserted"].is_number());
+    let disabled = f
+        .call("update_rule", json!({"id":rule_id,"enabled":false}))
+        .await?;
+    assert_eq!(disabled["isError"], false, "{disabled}");
+    f.clean().await
+}
+
+#[tokio::test]
+async fn declared_actions_execute_once_with_a_durable_result() -> anyhow::Result<()> {
+    let Some(mut f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    assert_eq!(f.call("list_actions", json!({})).await?["isError"], false);
+    let denied = f
+        .request(
+            f.kb,
+            "tools/call",
+            json!({"name":"create_action",
+        "arguments":{"key":"recompute","label":"Recompute","kind":"run_rules"}}),
+        )
+        .await
+        .map_err(|e| e.0)?
+        .0;
+    // Write tools are hidden from read-scoped tokens before dispatch.
+    assert_eq!(denied["error"]["code"], -32601);
+    let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+    sqlx::query("UPDATE kb_members SET role='editor' WHERE kb_id=$1 AND user_id=$2")
+        .bind(f.kb)
+        .bind(auth.user_id)
+        .execute(&f.state.pool)
+        .await?;
+    f.token = utopia_store::tokens::issue(
+        &f.state.pool,
+        auth.user_id,
+        "action test",
+        "write",
+        Some(&[f.kb]),
+        None,
+    )
+    .await?
+    .1;
+
+    let invalid = f
+        .call(
+            "create_action",
+            json!({
+                "key":"bad","label":"Bad","kind":"submit_statements",
+                "config":{"source_id":Uuid::now_v7()}
+            }),
+        )
+        .await?;
+    assert_eq!(invalid["isError"], true);
+    let made = f
+        .call(
+            "create_action",
+            json!({
+                "key":"recompute","label":"Recompute","kind":"run_rules"
+            }),
+        )
+        .await?;
+    assert_eq!(made["isError"], false, "{made}");
+    let id = uuid(&made["structuredContent"]["result"]["id"]);
+    let duplicate = f
+        .call(
+            "create_action",
+            json!({
+                "key":"recompute","label":"Recompute","kind":"run_rules"
+            }),
+        )
+        .await?;
+    assert_eq!(
+        duplicate["structuredContent"]["error"]["code"],
+        "action_key_exists"
+    );
+    let disabled = f
+        .call(
+            "update_action",
+            json!({"id":id,"expected_revision":1,"enabled":false}),
+        )
+        .await?;
+    assert_eq!(disabled["structuredContent"]["result"]["enabled"], false);
+    let request_id = Uuid::now_v7();
+    let blocked = f
+        .call(
+            "execute_action",
+            json!({"id":id,"request_id":request_id,"expected_revision":2,"args":{}}),
+        )
+        .await?;
+    assert_eq!(
+        blocked["structuredContent"]["error"]["code"],
+        "action_disabled"
+    );
+    f.call(
+        "update_action",
+        json!({"id":id,"expected_revision":2,"enabled":true}),
+    )
+    .await?;
+    let first = f
+        .call(
+            "execute_action",
+            json!({"id":id,"request_id":request_id,"expected_revision":3,"args":{}}),
+        )
+        .await?;
+    assert_eq!(first["isError"], false, "{first}");
+    assert_eq!(
+        first["structuredContent"]["result"]["run"]["status"],
+        "succeeded"
+    );
+    assert!(first["structuredContent"]["result"]["run"]["result"]["inserted"].is_number());
+    let run_id = uuid(&first["structuredContent"]["result"]["run"]["id"]);
+    f.call(
+        "update_action",
+        json!({"id":id,"expected_revision":3,"label":"Recompute again","enabled":false}),
+    )
+    .await?;
+    let replay = f
+        .call(
+            "execute_action",
+            json!({"id":id,"request_id":request_id,"expected_revision":3,"args":{}}),
+        )
+        .await?;
+    assert_eq!(replay["structuredContent"]["result"]["replayed"], true);
+    assert_eq!(
+        replay["structuredContent"]["result"]["run"]["id"],
+        run_id.to_string()
+    );
+    let conflict = f
+        .call(
+            "execute_action",
+            json!({"id":id,"request_id":request_id,"expected_revision":3,"args":{"typo":true}}),
+        )
+        .await?;
+    assert_eq!(
+        conflict["structuredContent"]["error"]["code"],
+        "request_id_conflict"
+    );
+    let status = f.call("action_status", json!({"run_id":run_id})).await?;
+    assert_eq!(status["structuredContent"]["result"]["status"], "succeeded");
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ontology_action_runs WHERE action_id=$1")
+            .bind(id)
+            .fetch_one(&f.state.pool)
+            .await?;
+    assert_eq!(count, 1);
+    let stale = f
+        .call(
+            "update_action",
+            json!({"id":id,"expected_revision":3,"enabled":true}),
+        )
+        .await?;
+    assert_eq!(
+        stale["structuredContent"]["error"]["code"],
+        "action_revision_conflict"
+    );
+    f.call(
+        "update_action",
+        json!({"id":id,"expected_revision":4,"enabled":true}),
+    )
+    .await?;
+    let concurrent_id = Uuid::now_v7();
+    let input = json!({"id":id,"request_id":concurrent_id,"expected_revision":5,"args":{}});
+    let (left, right) = tokio::join!(
+        f.call("execute_action", input.clone()),
+        f.call("execute_action", input)
+    );
+    let left = left?;
+    let right = right?;
+    assert_eq!(
+        left["structuredContent"]["result"]["run"]["id"],
+        right["structuredContent"]["result"]["run"]["id"]
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ontology_action_runs WHERE action_id=$1")
+            .bind(id)
+            .fetch_one(&f.state.pool)
+            .await?;
+    assert_eq!(count, 2);
+    f.clean().await
+}
+
+#[tokio::test]
+async fn statement_action_uses_existing_ingestion_and_records_failure() -> anyhow::Result<()> {
+    let Some(mut f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let source = utopia_store::sources::create(
+        &f.state.pool,
+        f.kb,
+        "statements",
+        "Action observations",
+        &json!({}),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+    sqlx::query("UPDATE kb_members SET role='editor' WHERE kb_id=$1 AND user_id=$2")
+        .bind(f.kb)
+        .bind(auth.user_id)
+        .execute(&f.state.pool)
+        .await?;
+    f.token = utopia_store::tokens::issue(
+        &f.state.pool,
+        auth.user_id,
+        "statement action test",
+        "write",
+        Some(&[f.kb]),
+        None,
+    )
+    .await?
+    .1;
+    let made = f
+        .call(
+            "create_action",
+            json!({"key":"observe","label":"Observe",
+        "kind":"submit_statements","config":{"source_id":source.id}}),
+        )
+        .await?;
+    assert_eq!(made["isError"], false, "{made}");
+    let id = uuid(&made["structuredContent"]["result"]["id"]);
+    let failed = f
+        .call(
+            "execute_action",
+            json!({"id":id,"request_id":Uuid::now_v7(),"expected_revision":1,
+        "args":{"external_id":"bad","e":[],"s":[],"n":[],"predicate_id":"bad"}}),
+        )
+        .await?;
+    assert_eq!(failed["isError"], true);
+    assert_eq!(
+        failed["structuredContent"]["result"]["run"]["status"],
+        "failed"
+    );
+    assert_eq!(
+        failed["structuredContent"]["result"]["run"]["error"]["code"],
+        "invalid_arguments"
+    );
+    let request_id = Uuid::now_v7();
+    let good = f
+        .call(
+            "execute_action",
+            json!({"id":id,"request_id":request_id,"expected_revision":1,
+        "args":{"external_id":"action-observation","e":[["Synthetic Alice","Person",true]],
+            "s":[[null,"Synthetic Alice","works for","Synthetic Team",null,{},null,null]],"n":[]}}),
+        )
+        .await?;
+    assert_eq!(
+        good["structuredContent"]["result"]["run"]["status"], "succeeded",
+        "{good}"
+    );
+    let document = utopia_store::documents::find_by_external_key(
+        &f.state.pool,
+        source.id,
+        "statements:action-observation",
+    )
+    .await?;
+    assert!(document.is_some());
+    let replay = f
+        .call(
+            "execute_action",
+            json!({"id":id,"request_id":request_id,"expected_revision":1,
+        "args":{"external_id":"action-observation","e":[["Synthetic Alice","Person",true]],
+            "s":[[null,"Synthetic Alice","works for","Synthetic Team",null,{},null,null]],"n":[]}}),
+        )
+        .await?;
+    assert_eq!(replay["structuredContent"]["result"]["replayed"], true);
+    f.clean().await
+}
+
+#[tokio::test]
+async fn mcp_statements_keep_source_identity_and_report_processing_state() -> anyhow::Result<()> {
+    let Some(mut f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let source = utopia_store::sources::create(
+        &f.state.pool,
+        f.kb,
+        "statements",
+        "Agent observations",
+        &json!({}),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let listed = f.call("list_statement_sources", json!({})).await?;
+    assert!(listed["structuredContent"]["result"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["id"] == source.id.to_string()));
+    let denied = f
+        .request(
+            f.kb,
+            "tools/call",
+            json!({
+                "name":"submit_statements", "arguments":{"source_id":source.id,"payload":{}}
+            }),
+        )
+        .await
+        .map_err(|e| e.0)?
+        .0;
+    assert_eq!(denied["error"]["code"], -32601);
+
+    let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+    sqlx::query("UPDATE kb_members SET role='editor' WHERE kb_id=$1 AND user_id=$2")
+        .bind(f.kb)
+        .bind(auth.user_id)
+        .execute(&f.state.pool)
+        .await?;
+    f.token = utopia_store::tokens::issue(
+        &f.state.pool,
+        auth.user_id,
+        "statement test",
+        "write",
+        Some(&[f.kb]),
+        None,
+    )
+    .await?
+    .1;
+    let foreign_source = utopia_store::sources::create(
+        &f.state.pool,
+        f.other_kb,
+        "statements",
+        "Other base observations",
+        &json!({}),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let foreign = f
+        .call(
+            "submit_statements",
+            json!({
+                "source_id":foreign_source.id,
+                "payload":{"external_id":"cross-base","e":[],"s":[],"n":[]}
+            }),
+        )
+        .await?;
+    assert_eq!(foreign["structuredContent"]["error"]["code"], "not_found");
+    let payload = json!({
+        "external_id":"synthetic-observation-1",
+        "doc_time":"2026-01-01T12:00:00Z",
+        "e":[["Demo Alice","person",true],["Demo Team","team",true]],
+        "s":[[null,"Demo Alice","belongs to","Demo Team",null,{},null,null]],
+        "n":[]
+    });
+    let submitted = f
+        .call(
+            "submit_statements",
+            json!({
+                "source_id":source.id,"payload":payload.clone()
+            }),
+        )
+        .await?;
+    assert_eq!(submitted["isError"], false, "{submitted}");
+    assert_eq!(
+        submitted["structuredContent"]["result"]["action"],
+        "created"
+    );
+    assert_eq!(
+        submitted["structuredContent"]["result"]["observation"]["typed_fact_count"],
+        0
+    );
+    let document_id = uuid(&submitted["structuredContent"]["result"]["observation"]["document_id"]);
+    let stored = utopia_store::documents::find_by_external_key(
+        &f.state.pool,
+        source.id,
+        "statements:synthetic-observation-1",
+    )
+    .await?
+    .unwrap();
+    assert_eq!(stored.id, document_id);
+    let audited: serde_json::Value = sqlx::query_scalar(
+        "SELECT detail FROM audit_events WHERE kb_id=$1 AND action='mcp.tool_called'
+         AND detail->>'tool'='submit_statements' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(f.kb)
+    .fetch_one(&f.state.pool)
+    .await?;
+    assert_eq!(audited["document_id"], document_id.to_string());
+    let status = f
+        .call(
+            "statement_status",
+            json!({
+                "source_id":source.id,"external_id":"synthetic-observation-1"
+            }),
+        )
+        .await?;
+    assert_eq!(
+        status["structuredContent"]["result"]["document_id"],
+        document_id.to_string()
+    );
+    let duplicate = f
+        .call(
+            "submit_statements",
+            json!({
+                "source_id":source.id,"payload":payload.clone()
+            }),
+        )
+        .await?;
+    assert_eq!(
+        duplicate["structuredContent"]["result"]["action"],
+        "unchanged"
+    );
+    let mut revised = payload;
+    revised["s"][0][2] = json!("reports to");
+    let changed = f
+        .call(
+            "submit_statements",
+            json!({
+                "source_id":source.id,"payload":revised
+            }),
+        )
+        .await?;
+    assert_eq!(changed["structuredContent"]["result"]["action"], "updated");
+    assert_eq!(
+        changed["structuredContent"]["result"]["observation"]["document_id"],
+        document_id.to_string()
+    );
+    assert_eq!(
+        changed["structuredContent"]["result"]["observation"]["version"],
+        2
+    );
+    let invalid = f
+        .call(
+            "submit_statements",
+            json!({
+                "source_id":source.id,
+                "payload":{"external_id":"bad","e":[],"s":[],"n":[],"predicate_id":Uuid::now_v7()}
+            }),
+        )
+        .await?;
+    assert_eq!(invalid["isError"], true);
+    assert_eq!(
+        invalid["structuredContent"]["error"]["code"],
+        "invalid_arguments"
+    );
+    crate::pipeline::process_document(&f.state, document_id).await?;
+    crate::extraction::extract_document(
+        &f.state,
+        document_id,
+        utopia_core::models::Proposer {
+            user_id: None,
+            token_id: None,
+        },
+    )
+    .await?;
+    let done = f
+        .call(
+            "statement_status",
+            json!({
+                "source_id":source.id,"external_id":"synthetic-observation-1"
+            }),
+        )
+        .await?;
+    assert!(
+        done["structuredContent"]["result"]["open_fact_count"]
+            .as_i64()
+            .unwrap()
+            >= 1
+    );
+    let latest_phrases: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT f.phrase FROM facts f
+         JOIN fact_evidence ev ON ev.fact_id=f.id
+         JOIN chunks c ON c.id=ev.chunk_id AND c.superseded_at IS NULL
+         WHERE ev.document_id=$1 AND f.layer='open' AND f.invalidated_at IS NULL",
+    )
+    .bind(document_id)
+    .fetch_all(&f.state.pool)
+    .await?;
+    assert!(latest_phrases.iter().any(|phrase| phrase == "reports to"));
+    let entities: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM entities WHERE kb_id=$1 AND canonical_name IN ('Demo Alice','Demo Team')")
+        .bind(f.kb).fetch_one(&f.state.pool).await?;
+    assert_eq!(entities, 2);
+    f.clean().await
+}
+
 /// 调一个工具，取它交给界面的那一步（#942）。MCP 的回复里没有这一步，所以直接调
 async fn step_of(
     f: &Fixture,

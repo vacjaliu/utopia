@@ -154,6 +154,7 @@ pub async fn create_entity_type(
     validate_key(key)?;
     validate_shape(shape)?;
     let id = Uuid::now_v7();
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO entity_types (id, kb_id, key, label, color, shape, description)
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -165,7 +166,7 @@ pub async fn create_entity_type(
     .bind(color)
     .bind(shape)
     .bind(description)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| match &e {
         sqlx::Error::Database(db) if db.is_unique_violation() => {
@@ -173,7 +174,8 @@ pub async fn create_entity_type(
         }
         _ => AppError::Db(e),
     })?;
-    set_parents(&mut *pool.acquire().await?, kb_id, id, parents).await?;
+    set_parents(&mut tx, kb_id, id, parents).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -250,6 +252,19 @@ async fn set_parents(
         ));
     }
     if !parents.is_empty() {
+        let (known,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM entity_types WHERE kb_id=$1 AND id=ANY($2::uuid[])",
+        )
+        .bind(kb_id)
+        .bind(parents)
+        .fetch_one(&mut *conn)
+        .await?;
+        if known != parents.iter().collect::<HashSet<_>>().len() as i64 {
+            return Err(AppError::invalid(
+                "unknown_parent",
+                "Every parent class must exist in this base",
+            ));
+        }
         // 候选父类的全部祖先里出现 child，就说明这条边会成环
         let (cycles,): (i64,) = sqlx::query_as(
             "WITH RECURSIVE up(id) AS (
@@ -286,7 +301,6 @@ async fn set_parents(
         .execute(&mut *conn)
         .await?;
     }
-    let _ = kb_id;
     Ok(())
 }
 
@@ -469,6 +483,7 @@ pub async fn create_relation_type(
     validate_property_links(&mut *pool.acquire().await?, kb_id, None, kind, ax).await?;
     let is_attr = kind == "attribute";
     let id = Uuid::now_v7();
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO relation_types (id, kb_id, key, label, temporal,
                                      functional, inverse_functional, description,
@@ -497,7 +512,7 @@ pub async fn create_relation_type(
     // 属性不带这两条（上面已经拦了非空的情况，这里是兜底）
     .bind(if is_attr { None } else { ax.inverse_of })
     .bind(if is_attr { None } else { ax.sub_property_of })
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| match &e {
         sqlx::Error::Database(db) if db.is_unique_violation() => {
@@ -506,13 +521,8 @@ pub async fn create_relation_type(
         _ => AppError::Db(e),
     })?;
     // attribute 不写 range：它的值域是字面量类型，落在 datatype 上
-    set_domains_ranges(
-        &mut *pool.acquire().await?,
-        id,
-        domains,
-        if is_attr { &[] } else { ranges },
-    )
-    .await?;
+    set_domains_ranges(&mut tx, id, domains, if is_attr { &[] } else { ranges }).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
