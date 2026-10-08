@@ -399,6 +399,8 @@ pub struct LlmClient {
     pub model: String,
     /// OpenAI 兼容口的 `reasoning_effort`；设了就带进每个对话请求体
     reasoning_effort: Option<String>,
+    /// 部分端点（如 SiliconFlow 的 Qwen3）用这个开关而非 reasoning_effort 关闭思考。
+    enable_thinking: Option<bool>,
     /// 流式调用发的补全上限。起点是 [`MAX_COMPLETION_TOKENS`]；端点用 400 说出自己更低的
     /// 上限后记在这里，同一个客户端（含它的克隆）此后都按它发，一个进程只吃一次拒绝
     /// （#891，#892 评审）。只降不升
@@ -483,9 +485,29 @@ impl LlmClient {
         self
     }
 
+    /// 结构化抽取是照原文写 JSON。SiliconFlow Qwen3 默认开启思考，而它的
+    /// `max_tokens` 不限制思考 token；长思考既耗时又可能只留下空的 content。
+    /// 只在这个已知端点、且未显式要求思考时关闭它，不改变普通聊天或别的模型。
+    pub fn for_structured_extraction(mut self) -> Self {
+        let siliconflow_qwen3 = reqwest::Url::parse(&self.base_url).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str() == Some("api.siliconflow.cn")
+                && url.path().trim_end_matches('/') == "/v1"
+                && self.model.starts_with("Qwen/Qwen3")
+        });
+        if siliconflow_qwen3 && matches!(self.reasoning_effort.as_deref(), None | Some("none")) {
+            self.reasoning_effort = None;
+            self.enable_thinking = Some(false);
+        }
+        self
+    }
+
     fn with_effort(&self, mut body: serde_json::Value) -> serde_json::Value {
         if let Some(e) = &self.reasoning_effort {
             body["reasoning_effort"] = json!(e);
+        }
+        if let Some(enabled) = self.enable_thinking {
+            body["enable_thinking"] = json!(enabled);
         }
         body
     }
@@ -514,6 +536,7 @@ impl LlmClient {
             api_key: api_key.map(String::from),
             model: model.to_string(),
             reasoning_effort: None,
+            enable_thinking: None,
             context_window: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
             completion_ceiling: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 MAX_COMPLETION_TOKENS,
@@ -653,13 +676,34 @@ impl LlmClient {
             }
             return Err(failure("LLM", status, retry_after, &parsed, &raw));
         };
+        // SiliconFlow 会在响应头给出排障用的 trace ID。只保留短的标识符，
+        // 不把响应正文或认证信息写进错误；断流时也能请端点按 ID 查原因。
+        let trace_id = resp
+            .headers()
+            .get("x-siliconcloud-trace-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| {
+                s.len() <= 128
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+            .map(str::to_owned);
         let mut bytes = resp.bytes_stream();
         let (mut buf, mut answer) = (SseBuffer::default(), String::new());
         let (mut saw_frame, mut ended) = (false, false);
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<Usage> = None;
         while let Some(part) = bytes.next().await {
-            let part = part.map_err(Unreachable)?;
+            let part = part.map_err(|e| {
+                let detail = e.to_string();
+                let err = anyhow::Error::new(Unreachable(e));
+                match &trace_id {
+                    Some(id) => err.context(format!(
+                        "LLM response stream failed: {detail}; provider trace ID: {id}"
+                    )),
+                    None => err,
+                }
+            })?;
             // 网络片段可能断在 UTF-8 字符中间，等完整 SSE 帧到齐再解码。
             buf.push(&part);
             // SSE 帧以空行分隔；最后一个不完整的帧留在 buf 里等下一片
@@ -1482,6 +1526,55 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn structured_extraction_disables_siliconflow_qwen3_thinking_only() {
+        let qwen = LlmClient::new(
+            "https://api.siliconflow.cn/v1/",
+            None,
+            "Qwen/Qwen3.5-35B-A3B",
+        )
+        .for_structured_extraction();
+        let body = qwen.with_effort(json!({}));
+        assert_eq!(body["enable_thinking"], false);
+        assert!(body.get("reasoning_effort").is_none());
+
+        let disabled = LlmClient::new(
+            "https://api.siliconflow.cn/v1",
+            None,
+            "Qwen/Qwen3.5-35B-A3B",
+        )
+        .with_reasoning_effort(Some("none".into()))
+        .for_structured_extraction();
+        let body = disabled.with_effort(json!({}));
+        assert_eq!(body["enable_thinking"], false);
+        assert!(body.get("reasoning_effort").is_none());
+
+        let explicit = LlmClient::new(
+            "https://api.siliconflow.cn/v1",
+            None,
+            "Qwen/Qwen3.5-35B-A3B",
+        )
+        .with_reasoning_effort(Some("low".into()))
+        .for_structured_extraction();
+        let body = explicit.with_effort(json!({}));
+        assert_eq!(body["reasoning_effort"], "low");
+        assert!(body.get("enable_thinking").is_none());
+
+        for (base, model) in [
+            (
+                "https://api.siliconflow.cn.evil.example/v1",
+                "Qwen/Qwen3.5-35B-A3B",
+            ),
+            ("https://api.siliconflow.cn/v1", "other/model"),
+            ("https://other.example/v1", "Qwen/Qwen3.5-35B-A3B"),
+        ] {
+            let body = LlmClient::new(base, None, model)
+                .for_structured_extraction()
+                .with_effort(json!({}));
+            assert!(body.get("enable_thinking").is_none(), "{base} {model}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -2047,6 +2140,34 @@ mod tests {
             };
             assert_eq!(turn.content.as_deref(), Some("whole answer"));
         }
+    }
+
+    #[tokio::test]
+    async fn interrupted_siliconflow_body_keeps_the_provider_trace_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\nX-SiliconCloud-Trace-Id: synthetic-123\r\nConnection: close\r\n\r\ndata:",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let err = client_at(addr)
+            .chat_at_streaming(&[], None)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(is_unreachable(&err), "{err:#}");
+        assert!(
+            err.to_string().contains("error decoding response body"),
+            "{err:#}"
+        );
+        assert!(format!("{err:#}").contains("synthetic-123"), "{err:#}");
     }
 
     /// 流式的一次问答收成整段：只要 `delta.content`，推理的增量不进返回值，

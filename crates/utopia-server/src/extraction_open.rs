@@ -77,11 +77,12 @@ async fn call_and_parse_one_chunk(
         };
         let messages =
             utopia_extract::open::build_open_messages(filename, known, opening, &chunk.text);
+        let extraction_client = client.clone().for_structured_extraction();
         // 温度 0：照抄原文的活不该靠采样。端点缺省 1.0 时同一块两次回复密度差三倍
         let reply = match chat_retrying_rate_limits_at(
             state,
             settings,
-            client,
+            &extraction_client,
             &messages,
             Some(0.0),
         )
